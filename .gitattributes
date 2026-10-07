@@ -1,0 +1,2 @@
+# start-gateway.bat must stay CRLF; cmd.exe breaks on anything else
+*.bat text eol=crlf
