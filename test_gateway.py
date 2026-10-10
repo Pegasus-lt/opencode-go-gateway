@@ -382,6 +382,16 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(rec["headers"]["x-opencode-session"], sid)
         self.assertEqual(self.count(rec, "x-opencode-session"), 1)
 
+    def test_existing_session_header_not_duplicated(self):
+        """客户端已发 x-opencode-session 时, 网关不重复添加。"""
+        sid = "ses_" + "ab" * 16
+        self.call("/v1/chat/completions", data=chat_body(),
+                  headers={"Content-Type": "application/json",
+                           "x-opencode-session": sid})
+        rec = records()[0]
+        self.assertEqual(rec["headers"]["x-opencode-session"], sid)
+        self.assertEqual(self.count(rec, "x-opencode-session"), 1)
+
     def test_native_values_passed_through_verbatim(self):
         """客户端给的 session 必须原样透传 —— 网关没有资格替它改名。
 

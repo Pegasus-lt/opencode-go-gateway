@@ -273,6 +273,7 @@ class Handler(BaseHTTPRequestHandler):
         out = {}
         for k, v in self.headers.items():
             lk = k.lower()
+            # 跳过 x-opencode-session 和 authorization, 后面统一设置, 避免重复
             if lk in DROP_REQ or lk in (SESSION_HEADER, "authorization"):
                 continue
             out[k] = v
