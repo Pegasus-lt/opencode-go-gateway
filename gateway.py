@@ -93,22 +93,23 @@ def content_derived_session(body: bytes) -> str:
     """
     客户端一个会话头都没给时的兜底。
 
-    关键 1: 只取 model + system prompt + 第一条 user 消息做哈希。
-    后续轮次这三段不变, 所以哈希稳定 -> 同一对话拿到同一个 id,
+    关键 1: 只取 system prompt + 第一条 user 消息做哈希。
+    后续轮次这两段不变, 所以哈希稳定 -> 同一对话拿到同一个 id,
     缓存亲和照样成立。不取全量 body, 否则每轮 prompt 变长都会换 id, 缓存全废。
 
-    关键 2: 必须加 model —— 同一句 "hi" 在两个模型上是两份缓存,
-    共用一个 session 只会互相颠簸。也顺带降低不同对话撞车的概率
-    (不同模型 → 不同 id)。
-
-    已知局限: 两条对话如果 model + system + 首条 user 完全一样(都以
-    "hi" 开头), 仍会撞到同一个 id —— 单个无状态请求里没有别的信号能
-    区分对话。要真正避免, 只能让客户端发会话头(见 NATIVE_SESSION_HEADERS)。
-
-    关键 3: 必须加 ses_ 前缀(官方工具的形态是 ses_ + 32 位小写 hex)。
+    关键 2: 必须加 ses_ 前缀(官方工具的形态是 ses_ + 32 位小写 hex)。
     2026-10-07 实测: 同一 447 token prompt, 裸 hex -> cached_tokens 恒为 0;
     ses_<32hex> -> cached_tokens 384。即裸 hex 在部分模型上不被识别为缓存键,
     等于过了 400 但缓存全废, 按全价烧钱。
+
+    刻意不含 model: 实测(_probe_session_model.py, 2026-10-10) 上游缓存是
+    model-aware 的 —— 同 prompt 同 session 换模型是冷的, model 已经在缓存键里。
+    不同模型共用 session 不会串答案, 颠簸也可以忽略, 放进 seed 属于多余。
+    派生只需保证"同对话同 id", 不需要区分模型。
+
+    已知局限: 两条对话如果 system + 首条 user 完全一样(都以 "hi" 开头),
+    仍会撞到同一个 id —— 单个无状态请求里没有别的信号能区分对话。要真正
+    避免, 只能让客户端发会话头(见 NATIVE_SESSION_HEADERS)。
     """
     try:
         data = json.loads(body or b"")
@@ -119,11 +120,6 @@ def content_derived_session(body: bytes) -> str:
         return "ses_" + hashlib.sha256(body or b"ogo").hexdigest()[:32]
 
     parts = []
-
-    # model: 同一对话在不同模型上是两份缓存, 不应共用一个 session
-    model = data.get("model")
-    if isinstance(model, str):
-        parts.append(model)
 
     sys_msg = data.get("system")
     if isinstance(sys_msg, str):

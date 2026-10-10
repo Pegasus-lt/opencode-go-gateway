@@ -339,18 +339,20 @@ class GatewayTest(unittest.TestCase):
         self.assertNotEqual(gateway.content_derived_session(a),
                             gateway.content_derived_session(b))
 
-    def test_derived_session_differs_by_model(self):
-        """修复 #3 的一部分: 同一句话不同模型 = 两份缓存, 不该共用 id。"""
+    def test_derived_session_ignores_model(self):
+        """刻意不含 model: 实测(_probe_session_model.py, 2026-10-10)
+        上游缓存是 model-aware 的, 不同模型共用 session 不会串答案也不会
+        明显颠簸, 把 model 放进 seed 属于多余。"""
         a = chat_body(model="deepseek-v4-flash")
         b = chat_body(model="deepseek-v4-pro")
-        self.assertNotEqual(gateway.content_derived_session(a),
-                            gateway.content_derived_session(b))
+        self.assertEqual(gateway.content_derived_session(a),
+                         gateway.content_derived_session(b))
 
         for m in ("deepseek-v4-flash", "deepseek-v4-pro"):
             self.call("/v1/chat/completions", data=chat_body(model=m),
                       headers={"Content-Type": "application/json"})
         sids = [r["headers"]["x-opencode-session"] for r in records()]
-        self.assertNotEqual(sids[0], sids[1])
+        self.assertEqual(sids[0], sids[1], "同一内容跨模型应共用一个 session")
 
     def test_derived_session_changes_when_system_prompt_changes(self):
         a = json.dumps({"model": "m", "system": "sys A",

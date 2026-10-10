@@ -27,10 +27,8 @@ and point your client's Base URL at it. **Change nothing else.**
 The gateway injects the header on forward:
 
 - Client already sends a session header → **forwarded as-is**
-- Client sends none → derive a stable id from `model + system prompt + first
-  user message` → **the same conversation on the same model always gets the
-  same id** (model is included because the same prompt on two models is two
-  separate caches and must not share an id)
+- Client sends none → derive a stable id from `system prompt + first user
+  message` → **the same conversation always gets the same id**
 
 > We measured whether the upstream only recognizes the official `ses_<32hex>`
 > shape as a cache key — it doesn't: 7/7 shapes hit the cache
