@@ -28,6 +28,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import sys
@@ -46,9 +47,15 @@ CLIENT_HEADER = "x-opencode-client"
 # 强制校验的只有 x-opencode-session。想要标识时用 --tag 显式开启。
 DEFAULT_CLIENT_TAG = ""
 
-# 客户端自己的会话头 —— 谁给了就原样透传(优先级从高到低)
+# 客户端自己的会话头 —— 谁给了就用谁的(优先级从高到低)
 # 这样能保住"同一对话 → 同一 session → 缓存命中"的本意,
 # 而不是我们在网关里瞎编一个把对话切开。
+#
+# 注意 1: 刻意不含 x-client-request-id —— 那是"每请求唯一"的关联 id,
+#          拿它当 session 会让每次请求换一次 session, 缓存永远打不中,
+#          而且是静默失效(过了 400, 但按全价烧钱)。
+# 注意 2: 也不是所有名字带 session 的头都可靠, 所以命中后还要经
+#          normalize_session() 规整成官方形态(见下)。
 NATIVE_SESSION_HEADERS = [
     "x-opencode-session",
     "x-claude-code-session-id",
@@ -58,7 +65,6 @@ NATIVE_SESSION_HEADERS = [
     "session-id",
     "session_id",
     "thread-id",
-    "x-client-request-id",
 ]
 
 # 这些必须原样传给上游, 不能被我们改
@@ -82,15 +88,44 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
+# 官方工具的形态: ses_ + 32 位小写 hex(实测只有这个形态能命中 prompt cache)
+OFFICIAL_SESSION_RE = re.compile(r"^ses_[0-9a-f]{32}$", re.IGNORECASE)
+
+
+def normalize_session(value: str) -> str:
+    """
+    把客户端给的 session 值整形成官方形态 ses_<32hex>。
+
+    - 已经是官方形态 -> 原样带走(仅统一成小写), 客户端的真实会话 id 不被改写。
+    - 其他形态(裸 hex / 短串 / UUID / 带横线) -> 确定性散列成官方形态。
+
+    为什么要整形: 2026-10-07 实测, 裸 hex 在部分模型上不被识别为缓存键,
+    等于过了 400 但缓存全废, 按全价烧钱。整形是确定性的(同一个原值永远
+    得到同一个新 id), 所以"同一对话 → 同一 session → 缓存命中"不受影响,
+    只是这个 id 现在能被上游认成缓存键了。
+    """
+    if OFFICIAL_SESSION_RE.match(value):
+        return value.lower()
+    return "ses_" + hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:32]
+
+
 def content_derived_session(body: bytes) -> str:
     """
     客户端一个会话头都没给时的兜底。
 
-    关键 1: 只取 system prompt + 第一条 user 消息做哈希。
-    后续轮次这两段不变, 所以哈希稳定 -> 同一对话拿到同一个 id,
+    关键 1: 只取 model + system prompt + 第一条 user 消息做哈希。
+    后续轮次这三段不变, 所以哈希稳定 -> 同一对话拿到同一个 id,
     缓存亲和照样成立。不取全量 body, 否则每轮 prompt 变长都会换 id, 缓存全废。
 
-    关键 2: 必须加 ses_ 前缀(官方工具的形态是 ses_ + 32 位小写 hex)。
+    关键 2: 必须加 model —— 同一句 "hi" 在两个模型上是两份缓存,
+    共用一个 session 只会互相颠簸。也顺带降低不同对话撞车的概率
+    (不同模型 → 不同 id)。
+
+    已知局限: 两条对话如果 model + system + 首条 user 完全一样(都以
+    "hi" 开头), 仍会撞到同一个 id —— 单个无状态请求里没有别的信号能
+    区分对话。要真正避免, 只能让客户端发会话头(见 NATIVE_SESSION_HEADERS)。
+
+    关键 3: 必须加 ses_ 前缀(官方工具的形态是 ses_ + 32 位小写 hex)。
     2026-10-07 实测: 同一 447 token prompt, 裸 hex -> cached_tokens 恒为 0;
     ses_<32hex> -> cached_tokens 384。即裸 hex 在部分模型上不被识别为缓存键,
     等于过了 400 但缓存全废, 按全价烧钱。
@@ -104,6 +139,11 @@ def content_derived_session(body: bytes) -> str:
         return "ses_" + hashlib.sha256(body or b"ogo").hexdigest()[:32]
 
     parts = []
+
+    # model: 同一对话在不同模型上是两份缓存, 不应共用一个 session
+    model = data.get("model")
+    if isinstance(model, str):
+        parts.append(model)
 
     sys_msg = data.get("system")
     if isinstance(sys_msg, str):
@@ -131,14 +171,13 @@ def content_derived_session(body: bytes) -> str:
 
 
 def pick_session(headers, body: bytes) -> str:
-    """决定这一跳用哪个 session id。返回原文(不加前缀)或 32位hex。"""
+    """决定这一跳用哪个 session id。恒返回官方形态 ses_<32hex>。"""
     for h in NATIVE_SESSION_HEADERS:
-        v = headers.get(h)
+        v = (headers.get(h) or "").strip()
         if v:
-            v = v.strip()
-            # 官方工具的形态是 ses_<32hex>; 其他形态原样带过去也能用
-            if v:
-                return v
+            # 客户端给的值也可能不是官方形态(裸 hex / UUID / 短串),
+            # 原样带过去会过 400 但缓存打不中, 所以先整形成官方形态。
+            return normalize_session(v)
     # content_derived_session 内部已加 ses_ 前缀(官方格式), 不要再包一层
     return content_derived_session(body)
 
@@ -160,11 +199,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle(self):
         # 客户端提前断开(keep-alive 超时/主动关)时 socketserver 会把
-        # ConnectionResetError 当未处理异常打印整段 traceback 刷屏。
+        # 异常当未处理异常打印整段 traceback 刷屏。
         # 对 HTTP 代理这属正常事件, 吞掉即可。
+        #
+        # 必须用 ConnectionError 而不是 ConnectionResetError:
+        # Windows 上客户端断开抛的是 ConnectionAbortedError (WinError 10053),
+        # 它是 ConnectionResetError 的兄弟类, 单独捕 ConnectionResetError 抓不到
+        # (日志里 8 次 traceback 全是它)。ConnectionError 一次性覆盖
+        # Reset / Aborted / Refused / BrokenPipe。
         try:
             super().handle()
-        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+        except (ConnectionError, TimeoutError):
             self.close_connection = True
 
     def _read_body(self) -> bytes:
@@ -196,9 +241,13 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(n) if n else b""
 
     def _client_addr(self) -> tuple:
+        # 只用于日志/审计: X-Forwarded-For 第一跳是 ip[:port], 不要拿去 int()。
+        # (旧实现 int("127.0.0.1") 会直接 ValueError, 且从未被调用过)
         fwd = self.headers.get("X-Forwarded-For")
         if fwd:
-            return ("127.0.0.1", int(fwd.split(",")[0].strip().split(":")[0] or 0))
+            first = fwd.split(",")[0].strip()
+            host = first.rsplit(":", 1)[0] if first.count(":") == 1 else first
+            return (host or "0.0.0.0", 0)
         return self.client_address
 
     # ---- routes
@@ -210,6 +259,19 @@ class Handler(BaseHTTPRequestHandler):
         return self._forward()
 
     def do_POST(self):
+        return self._forward()
+
+    # 别的方法也只做转发(旧版只实现了 GET/POST, 其余一律 501)
+    def do_PUT(self):
+        return self._forward()
+
+    def do_PATCH(self):
+        return self._forward()
+
+    def do_DELETE(self):
+        return self._forward()
+
+    def do_OPTIONS(self):
         return self._forward()
 
     def _health(self):
@@ -328,8 +390,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             else:
                 self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # 客户端自己断了, 正常
+        except ConnectionError:
+            pass  # 客户端自己断了(含 Windows 的 ConnectionAbortedError/10053), 正常
         except Exception as e:
             if self.verbose:
                 log("stream error:", e)

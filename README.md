@@ -26,9 +26,17 @@ and point your client's Base URL at it. **Change nothing else.**
 
 The gateway injects the header on forward:
 
-- Client already sends a session header → **forwarded as-is**
-- Client sends none → derive a stable id from `system prompt + first user
-  message` → **the same conversation always gets the same id**
+- Client already sends a session header → if it is already in the official
+  form (`ses_<32 hex>`) it is **forwarded verbatim**; any other form (bare hex,
+  a short string, a UUID) is **deterministically normalized** into that shape.
+  Why normalize: a non-official form still passes the 400, but several models
+  don't recognize it as a cache key — so you pass the 400 with a cold cache
+  and pay full price. Normalization is deterministic, so a conversation still
+  maps to one stable id.
+- Client sends none → derive a stable id from `model + system prompt + first
+  user message` → **the same conversation on the same model always gets the
+  same id** (model is included because the same prompt on two models is two
+  separate caches and must not share an id)
 
 Result: the 400 is gone, and each conversation keeps its own warm cache. Not a
 fake constant-header fix — a fix that actually preserves the cache.
@@ -143,6 +151,19 @@ Keep the window minimized; closing it cuts client connections.
 | 400 protocol error | Upstream serves three endpoint families (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) and the model doesn't match your client's protocol. Try another model. |
 | Connection refused | Gateway not running. Run `curl http://127.0.0.1:8787/_health` first; JSON back means it is up |
 | Slow first token | Normal — streaming is forwarded without buffering. If it suddenly got slow, buffering was introduced somewhere |
+
+## Tests
+
+Local regression suite — **no API key needed, and it never talks to the real
+upstream** (it starts a mock upstream plus a real gateway in-process):
+
+```bash
+python test_gateway.py -v
+```
+
+It covers: no traceback on client abort (Windows), session form and
+stability, cache affinity, SSE not being buffered, chunked uploads, and
+header integrity on forward.
 
 ## License
 
