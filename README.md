@@ -26,17 +26,17 @@ and point your client's Base URL at it. **Change nothing else.**
 
 The gateway injects the header on forward:
 
-- Client already sends a session header → if it is already in the official
-  form (`ses_<32 hex>`) it is **forwarded verbatim**; any other form (bare hex,
-  a short string, a UUID) is **deterministically normalized** into that shape.
-  Why normalize: a non-official form still passes the 400, but several models
-  don't recognize it as a cache key — so you pass the 400 with a cold cache
-  and pay full price. Normalization is deterministic, so a conversation still
-  maps to one stable id.
+- Client already sends a session header → **forwarded as-is**
 - Client sends none → derive a stable id from `model + system prompt + first
   user message` → **the same conversation on the same model always gets the
   same id** (model is included because the same prompt on two models is two
   separate caches and must not share an id)
+
+> We measured whether the upstream only recognizes the official `ses_<32hex>`
+> shape as a cache key — it doesn't: 7/7 shapes hit the cache
+> (`_probe_session_form.py`, 2026-10-10, `deepseek-v4-flash`). So the value is
+> passed through untouched; rewriting a client's session identity would be
+> surprising for no benefit.
 
 Result: the 400 is gone, and each conversation keeps its own warm cache. Not a
 fake constant-header fix — a fix that actually preserves the cache.

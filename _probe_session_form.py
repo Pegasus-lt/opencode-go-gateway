@@ -18,6 +18,23 @@ gateway.py 里有条 2026-10-07 的实测记录:
 
 这个脚本用数据定这件事, 不靠推理。
 
+实测结果(2026-10-10, deepseek-v4-flash, 7 形态 x 3 轮)
+------------------------------------------------
+  official ses_+32hex   0  256  256   HIT
+  upper    SES_+32HEX   0  256  256   HIT
+  bare     32hex        -  512  512   HIT
+  bare     64hex        0  256  256   HIT
+  short    'abc-123456' 0  256  256   HIT
+  uuid                  0  256  256   HIT
+  ses_+非hex             0  256  256   HIT
+
+7/7 全部命中 —— 上游缓存与 session 形态无关。所以 gateway.py 不做整形,
+客户端给什么就发什么。
+
+(顺带: 本机到 opencode.ai 的 TLS 握手会间歇性超时/证书失败, 12 次里只成
+3 次。所以这里复用一条已校验的连接, 21 个请求只付一次握手。证书校验
+不通过时不会发 Authorization 头, 密钥不会流到没校验过的对端。)
+
 怎么测的
 --------
 对每种形态:
@@ -43,14 +60,15 @@ gateway.py 里有条 2026-10-07 的实测记录:
 """
 
 import argparse
+import http.client
 import json
 import os
 import random
 import secrets
+import ssl
 import sys
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 import uuid
 
 # Windows 控制台是 GBK, 输出里有中文/制表符, 管道或部分终端下会
@@ -91,38 +109,88 @@ def make_prompt(nonce: str) -> str:
     return f"{base}\n\n[probe nonce: {nonce}]\n\nReply with the single word: pong"
 
 
-def post(url, key, sid, prompt, model, max_tokens, timeout):
-    """发一次请求, 返回 (status, cached_tokens, prompt_tokens, err)。"""
-    body = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={
-            "Authorization": f"Bearer {key}",
+class Upstream:
+    """复用一条经过证书校验的连接, 避免每个请求都重新 TLS 握手。
+
+    本机实测 opencode.ai 的 TLS 握手间歇性超时/证书失败。HTTPSConnection
+    在证书校验成功前不会发送 HTTP 请求头, 包括 Authorization; 不可信证书
+    会在 connect() 阶段失败并被丢弃。握手成功后 21 次探测共用同一条连接。
+    """
+    def __init__(self, url, key, timeout, retries):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise ValueError(f"不支持的上游 URL: {url}")
+        self.scheme = u.scheme
+        self.host = u.hostname
+        self.port = u.port or (443 if u.scheme == "https" else 80)
+        self.path = urllib.parse.urlunsplit(("", "", u.path or "/", u.query, ""))
+        self.key = key
+        self.timeout = timeout
+        self.retries = max(1, retries)
+        self.conn = None
+
+    def close(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+    def _connect(self):
+        if self.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                self.host, self.port, timeout=self.timeout,
+                context=ssl.create_default_context())
+        else:
+            conn = http.client.HTTPConnection(self.host, self.port,
+                                               timeout=self.timeout)
+        # 先独立握手+校验证书; 不通过时绝不发送含 key 的 HTTP 请求。
+        conn.connect()
+        self.conn = conn
+
+    def post(self, sid, prompt, model, max_tokens):
+        body = json.dumps({
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode()
+        headers = {
+            "Authorization": f"Bearer {self.key}",
             "Content-Type": "application/json",
             "User-Agent": PROBE_UA,
             "x-opencode-session": sid,
-        })
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        raw = e.read()
-        try:
-            msg = json.loads(raw).get("error", {}).get("message", "")
-        except Exception:
-            msg = raw[:200].decode("utf-8", "replace")
-        return e.code, None, None, msg[:120]
-    except Exception as e:
-        return None, None, None, repr(e)
+        }
+        last = None
+        for attempt in range(self.retries):
+            try:
+                if self.conn is None:
+                    self._connect()
+                self.conn.request("POST", self.path, body=body, headers=headers)
+                resp = self.conn.getresponse()
+                raw = resp.read()
+                status = resp.status
+                if status != 200:
+                    try:
+                        msg = json.loads(raw).get("error", {}).get("message", "")
+                    except Exception:
+                        msg = raw[:200].decode("utf-8", "replace")
+                    self.close()
+                    if status == 429 or 500 <= status < 600:
+                        last = f"HTTP {status}: {msg[:120]}"
+                        time.sleep(min(0.5 * (attempt + 1), 3.0))
+                        continue
+                    return status, None, None, msg[:120]
 
-    usage = data.get("usage") or {}
-    details = usage.get("prompt_tokens_details") or {}
-    cached = details.get("cached_tokens")
-    return 200, cached, usage.get("prompt_tokens"), None
+                data = json.loads(raw)
+                usage = data.get("usage") or {}
+                details = usage.get("prompt_tokens_details") or {}
+                return 200, details.get("cached_tokens"), usage.get("prompt_tokens"), None
+            except Exception as e:
+                last = repr(e)
+                self.close()
+                time.sleep(min(0.5 * (attempt + 1), 3.0))
+        return None, None, None, f"重试 {self.retries} 次仍失败: {last}"
 
 
 def main():
@@ -136,6 +204,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1)
     ap.add_argument("--sleep", type=float, default=1.0, help="每轮之间歇几秒")
     ap.add_argument("--timeout", type=int, default=90)
+    ap.add_argument("--retries", type=int, default=6,
+                    help="TLS/限流失败重试几次(默认 6)")
     args = ap.parse_args()
 
     key = args.key or os.environ.get("OGO_GW_KEY", "")
@@ -156,6 +226,7 @@ def main():
   ────────────────────────────────────────────
 """)
 
+    upstream = Upstream(args.url, key, args.timeout, args.retries)
     results = []
     for idx, (name, is_official, gen) in enumerate(forms):
         sid = gen()
@@ -166,9 +237,8 @@ def main():
         for r in range(n):
             if r:
                 time.sleep(args.sleep)
-            status, cached, ptok, e = post(
-                args.url, key, sid, prompt, args.model,
-                args.max_tokens, args.timeout)
+            status, cached, ptok, e = upstream.post(
+                sid, prompt, args.model, args.max_tokens)
             if status != 200:
                 err = f"HTTP {status}: {e}"
                 break
@@ -189,6 +259,8 @@ def main():
               f"sid={sid[:20]}{'…' if len(sid) > 20 else ''}")
         if err:
             print(f"         -> {err}")
+
+    upstream.close()
 
     # -------------------------------------------------------------- 结论
     print("\n" + "─" * 60)

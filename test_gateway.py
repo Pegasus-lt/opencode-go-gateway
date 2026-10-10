@@ -380,33 +380,37 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(rec["headers"]["x-opencode-session"], sid)
         self.assertEqual(self.count(rec, "x-opencode-session"), 1)
 
-    def test_normalize_session_official_form_kept(self):
-        official = "ses_" + "ef" * 16
-        self.assertEqual(gateway.normalize_session(official), official)
-        # 大写形式也要整形成小写官方形态, 但不能被散列掉
-        upper = "SES_" + "EF" * 16
-        self.assertEqual(gateway.normalize_session(upper), official)
-        self.assertEqual(gateway.normalize_session(upper),
-                         gateway.normalize_session(official),
-                         "大小写不同的同一 id 应该收敛到同一个 session")
+    def test_native_values_passed_through_verbatim(self):
+        """客户端给的 session 必须原样透传 —— 网关没有资格替它改名。
 
-    def test_normalize_session_non_official_form(self):
-        """修复 #4/#5: 裸 hex / 短串 / UUID 都被整形成官方形态, 且稳定。"""
-        for value in ("abc123", "thread-77", "REQ_1234",
-                      "a" * 40, "550e8400-e29b-41d4-a716-446655440000"):
-            got = gateway.normalize_session(value)
-            self.assertRegex(got, r"^ses_[0-9a-f]{32}$", f"value={value}")
-            self.assertEqual(got, gateway.normalize_session(value),
-                             f"normalize 不确定, 同一原值给出不同 id: {value}")
-            self.assertNotEqual(got, value)
+        依据: _probe_session_form.py 实测(2026-10-10, deepseek-v4-flash)
+        上游缓存与 session 形态无关, 7 种形态全部命中。所以整形既没必要,
+        又会把客户端的会话身份换掉。
+        """
+        cases = [
+            "ses_" + "ef" * 16,                        # 官方形态
+            "SES_" + "EF" * 16,                        # 官方形态大写
+            "1bda55fef85296e4aebe834442ee6254",          # 裸 32hex
+            "af62ec49467f0f244a0c7dce04dab6ad9fbc782281",  # 裸 64hex
+            "abc-123",                                  # 短串
+            "550e8400-e29b-41d4-a716-446655440000",     # uuid
+            "ses_" + "z" * 31,                         # ses_ 但不是 hex
+            "a" * 200,                                 # 超长
+        ]
+        for value in cases:
+            got = gateway.pick_session({"x-session-id": value}, b"")
+            self.assertEqual(got, value, f"被改写了: {value!r} -> {got!r}")
 
-    def test_non_official_native_header_normalized_end_to_end(self):
+    def test_native_value_whitespace_stripped(self):
+        got = gateway.pick_session({"x-session-id": "  abc-123  "}, b"")
+        self.assertEqual(got, "abc-123")
+
+    def test_non_official_native_header_passed_through_end_to_end(self):
         self.call("/v1/chat/completions", data=chat_body(),
                   headers={"Content-Type": "application/json",
                            "x-session-id": "abc-123"})
         sid = records()[0]["headers"]["x-opencode-session"]
-        self.assertRegex(sid, r"^ses_[0-9a-f]{32}$")
-        self.assertEqual(sid, gateway.normalize_session("abc-123"))
+        self.assertEqual(sid, "abc-123", "非官方形态被改写了")
 
     def test_client_request_id_not_used_as_session(self):
         """修复 #5: x-client-request-id 是每请求唯一 id, 不该当 session。"""
