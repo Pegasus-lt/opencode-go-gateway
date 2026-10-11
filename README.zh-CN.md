@@ -2,23 +2,24 @@
 
 > **English**：[README.md](README.md)
 
-一个本地小网关：补上 OpenCode Go 要求的请求头，让**任何能对接 OpenCode Go 的客户端**都能直连它，不改协议、不换客户端。
+一个本地小网关：把客户端自带的会话头翻译成 OpenCode Go 要求的 `x-opencode-session`，让**任何能对接 OpenCode Go 的客户端**都能直连它，不改协议、不换客户端。
 
 ## 问题
 
 1. OpenCode Go 每个推理请求都必须带 `x-opencode-session` 头，**不带就报 400**（`MissingSessionID`），没有商量余地。
-2. 官方 opencode CLI 自动带这个头，但第三方客户端（MiMoCode 等大多数第三方客户端）普遍**没有「自定义请求头」的设置项**——这个头根本没地方填。
+2. 客户端们各自发的会话头五花八门（MiMoCode 发 `x-session-affinity`、Claude Code 发 `x-claude-code-session-id`……），但**没有一个是上游认的 `x-opencode-session`**，而且这些客户端的设置界面普遍没有「自定义请求头」入口，改不了。
 3. 网上流传的土办法是在配置里**写死一个常量**：能过 400，但所有对话共用一个缓存槽、互相冲刷。缓存读比输入便宜 31 倍（`deepseek-v4-flash`：$0.22 vs $0.007 每百万 token），缓存全废等于按 31 倍全价烧钱——**花钱买罪受**。
 
 ## 解决思路
 
 本地起一个纯标准库的小网关（单文件，不用装任何依赖），客户端把 Base URL 指向它，**其他什么都不用改**。
 
-网关在转发时补这个头：
+网关只做**会话头翻译**，不编造会话身份：
 
-- 客户端自己带了会话头 → **原样透传**
-- 客户端没带 → 按「system prompt + 第一条用户消息」算出一个稳定 id → **同一段对话永远是同一个 id**
-- 只在需要的请求上补（推理 POST）；`GET /models` 这类上游不校验，网关不打扰
+- 客户端自带 `x-opencode-session` → **原样透传**
+- 只带 `x-session-affinity` / `x-claude-code-session-id` 等 → **翻译成** `x-opencode-session`
+- **一个会话头都不带 → 网关直接 400**，消息里写明要带哪个头（随机 id / 内容哈希都能过 400，但拿不到稳定缓存亲和，会按全价烧钱——所以网关不做）
+- 只在需要的请求上处理（推理 POST）；`GET /models` 这类上游不校验，网关不打扰
 
 > 我们实测过上游是不是只认官方形态 `ses_<32hex>` 当缓存键 —— 不是：7 种形态
 > 全部命中（2026-10-10，`deepseek-v4-flash`）。所以原样透传；改写客户端的
@@ -78,8 +79,13 @@ curl http://127.0.0.1:8787/v1/models
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer sk-你的key" \
   -H "Content-Type: application/json" \
+  -H "x-session-affinity: ses_00000000000000000000000000000001" \
   -d '{"model":"deepseek-v4-flash","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
 ```
+
+> curl 没有自带的会话头，所以要手动给一个（`x-session-affinity` 或
+> `x-opencode-session` 都行，任意非空字符串都可以）。**不带会收到网关的
+> 400 `missing session header`**。
 
 返回 200 + 内容就通了。`-v` 日志长这样就是正常工作：
 
@@ -115,6 +121,9 @@ mimo -m opencode-go/deepseek-v4-flash
 
 或进 TUI 后输 `/models` 切换。
 
+> ⚠️ MiMoCode 的**临时会话（ephemeral）不发会话头**，这类对话会被网关 400 拒
+> （`missing session header`）。日常对话自带 `x-session-affinity`，不受影响。
+
 ### 日常启动
 
 网关不进开机自启——每次用之前手动起：双击 `start-gateway.bat`，或 `python gateway.py -v`。
@@ -124,6 +133,7 @@ mimo -m opencode-go/deepseek-v4-flash
 
 | 现象 | 原因 |
 |---|---|
+| `missing session header` | 客户端没带任何会话头。日常客户端（MiMoCode 等）自带，不会遇到；curl/自建脚本要手动加 `-H "x-session-affinity: ses_xxx"` |
 | 还是报 `MissingSessionID` | 网关没起，或 Base URL 填成了 `https://opencode.ai/zen/go/v1`（应该是 `http://127.0.0.1:8787/v1`） |
 | 400 协议错误 | 上游有三种端点（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`），模型和你客户端的协议对不上——换一个模型就行 |
 | 连接被拒 | 网关没在跑。先 `curl http://127.0.0.1:8787/_health`，返回 JSON 就是好的 |

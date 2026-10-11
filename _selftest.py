@@ -28,6 +28,8 @@ if not KEY:
           "或设置环境变量 OGO_GW_KEY", file=sys.stderr)
     sys.exit(2)
 MODEL = "deepseek-v4.1-flash"
+# 网关不再派生 session: 除「无会话头」用例外的所有 POST 都必须自带一个
+TEST_SID = "ses_selftest0000000000000000000001"
 # MiMoCode 真实请求头形态: User-Agent 是 mimocode/<version>
 MIMO_UA = "mimocode/1.15.0"
 
@@ -84,20 +86,21 @@ def t_models():
         check("models: GET /v1/models 200 且非空", False, repr(e))
 
 
-# ------------------------------------------- 3. 无会话头 -> 内容派生 (curl 场景)
-def t_derived_session():
+# ------------------------------------- 3. 无会话头 -> 网关直接 400 (不派生)
+def t_missing_session_rejected():
     body = {
         "model": MODEL, "max_tokens": 8,
         "messages": [{"role": "user", "content": "reply with the word pong only"}],
     }
     try:
-        st, _, b = chat(body)
-        d = json.loads(b)
-        ok = st == 200 and d.get("choices")
-        check("derived: 无会话头请求 200", ok,
-              f"status={st} err={d.get('error', {}).get('message', '')[:80]}")
+        st, _, b = chat(body)          # 不带任何会话头
+        d = json.loads(b) if b else {}
+        msg = ((d.get("error") or {}).get("message") or "")
+        check("session: 无会话头 -> 网关 400 且提示要带哪个头",
+              st == 400 and "missing session header" in msg,
+              f"status={st} msg={msg[:90]}")
     except Exception as e:
-        check("derived: 无会话头请求 200", False, repr(e))
+        check("session: 无会话头 -> 网关 400 且提示要带哪个头", False, repr(e))
 
 
 # --------------------------- 4. x-session-affinity (MiMoCode 真实请求头形态)
@@ -129,7 +132,7 @@ def t_cache_affinity():
     cached = []
     try:
         for i in range(3):
-            st, _, b = chat(body)
+            st, _, b = chat(body, {"x-session-affinity": TEST_SID})
             d = json.loads(b)
             if st != 200 or not d.get("choices"):
                 check("cache: 重复请求 200", False, f"round={i} status={st} "
@@ -155,7 +158,7 @@ def t_streaming():
     r = urllib.request.Request(
         f"{BASE}/chat/completions", data=json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json",
-                 "User-Agent": MIMO_UA})
+                 "User-Agent": MIMO_UA, "x-session-affinity": TEST_SID})
     t0 = time.time()
     first_chunk = None
     last_chunk = None
@@ -207,7 +210,7 @@ def t_big_body():
     }
     raw = json.dumps(body).encode()
     try:
-        st, _, b = chat(body, timeout=120)
+        st, _, b = chat(body, {"x-session-affinity": TEST_SID}, timeout=120)
         d = json.loads(b)
         check("bigbody: ~100KB 请求 200", st == 200 and bool(d.get("choices")),
               f"req={len(raw)}B status={st} "
@@ -268,7 +271,8 @@ def t_blocked_ua_rewritten():
     }
     st, _, b = req("POST", f"{BASE}/chat/completions",
                    data=json.dumps(body).encode(),
-                   headers={"Content-Type": "application/json"},
+                   headers={"Content-Type": "application/json",
+                            "x-session-affinity": TEST_SID},
                    ua="Python-urllib/3.13")
     d = json.loads(b) if b else {}
     check("ua: Python-urllib 被网关替换后 200", st == 200 and bool(d.get("choices")),
@@ -287,7 +291,8 @@ def t_no_ua():
     try:
         c.request("POST", (u.path or "") + "/chat/completions", body=body,
                   headers={"Content-Type": "application/json",
-                           "Authorization": f"Bearer {KEY}"})
+                           "Authorization": f"Bearer {KEY}",
+                           "x-session-affinity": TEST_SID})
         resp = c.getresponse()
         d = json.loads(resp.read())
         check("ua: 完全无 UA 请求 200", resp.status == 200 and bool(d.get("choices")),
@@ -313,6 +318,7 @@ def t_chunked_request():
         c.putheader("Transfer-Encoding", "chunked")
         c.putheader("Authorization", f"Bearer {KEY}")
         c.putheader("User-Agent", MIMO_UA)
+        c.putheader("x-session-affinity", TEST_SID)
         c.endheaders()
         # 分两段发, 模拟真实 chunked
         half = len(payload) // 2
@@ -334,7 +340,7 @@ def main():
     t_health()
     t_models()
     t_query_string()
-    t_derived_session()
+    t_missing_session_rejected()
     t_mimo_affinity()
     t_cache_affinity()
     t_streaming()

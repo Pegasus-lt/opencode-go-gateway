@@ -5,8 +5,12 @@ ogo-gw — OpenCode Go 本地网关
 解决: Request is missing x-opencode-session (400 MissingSessionID)
 
 原理: OpenCode Go 网关把请求按 x-opencode-session 做一致性路由 + prompt cache 亲和。
-      客户端不发这头 -> 400。官方 opencode CLI 一直发, 所以只有第三方客户端炸。
-      本地网关做反向代理, 在转发前补上这头。
+      客户端不发这头 -> 400。官方 opencode CLI 一直发, 所以第三方客户端炸。
+      本地网关做反向代理, 把客户端自带的会话头(x-session-affinity 等)
+      翻译成 x-opencode-session 再转发。
+
+      网关不编造会话身份: 客户端一个会话头都没带 -> 直接 400 并提示要带哪个头。
+      原因: 随机/哈希派生都能过 400, 但拿不到稳定缓存亲和, 会按全价烧钱。
 
 只用标准库, 不需要 pip install。
 
@@ -24,7 +28,6 @@ API Key 不变。
 """
 
 import argparse
-import hashlib
 import http.client
 import json
 import os
@@ -89,71 +92,16 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
-def content_derived_session(body: bytes) -> str:
+def pick_session(headers) -> str:
+    """命中客户端会话头就原样用(按 NATIVE_SESSION_HEADERS 优先级), 都没有返回 None。
+
+    网关不做任何内容派生 —— 会话身份必须由客户端自己给(见 _forward 的 400 拒绝)。
     """
-    客户端一个会话头都没给时的兜底。
-
-    关键 1: 只取 system prompt + 第一条 user 消息做哈希。
-    后续轮次这两段不变, 所以哈希稳定 -> 同一对话拿到同一个 id,
-    缓存亲和照样成立。不取全量 body, 否则每轮 prompt 变长都会换 id, 缓存全废。
-
-    关键 2: 必须加 ses_ 前缀(官方工具的形态是 ses_ + 32 位小写 hex)。
-    2026-10-07 实测: 同一 447 token prompt, 裸 hex -> cached_tokens 恒为 0;
-    ses_<32hex> -> cached_tokens 384。即裸 hex 在部分模型上不被识别为缓存键,
-    等于过了 400 但缓存全废, 按全价烧钱。
-
-    刻意不含 model: 2026-10-10 实测 上游缓存是 model-aware 的 —— 同 prompt
-    同 session 换模型是冷的, model 已经在缓存键里。
-    不同模型共用 session 不会串答案, 颠簸也可以忽略, 放进 seed 属于多余。
-    派生只需保证"同对话同 id", 不需要区分模型。
-
-    已知局限: 两条对话如果 system + 首条 user 完全一样(都以 "hi" 开头),
-    仍会撞到同一个 id —— 单个无状态请求里没有别的信号能区分对话。要真正
-    避免, 只能让客户端发会话头(见 NATIVE_SESSION_HEADERS)。
-    """
-    try:
-        data = json.loads(body or b"")
-    except Exception:
-        return "ses_" + hashlib.sha256(body or b"ogo").hexdigest()[:32]
-
-    if not isinstance(data, dict):
-        return "ses_" + hashlib.sha256(body or b"ogo").hexdigest()[:32]
-
-    parts = []
-
-    sys_msg = data.get("system")
-    if isinstance(sys_msg, str):
-        parts.append(sys_msg)
-    elif isinstance(sys_msg, list):
-        parts.extend(
-            m.get("text", "") for m in sys_msg
-            if isinstance(m, dict) and m.get("type") in (None, "text")
-        )
-
-    for m in data.get("messages") or []:
-        if isinstance(m, dict) and m.get("role") == "user":
-            c = m.get("content")
-            if isinstance(c, str):
-                parts.append(c)
-            elif isinstance(c, list):
-                parts.extend(
-                    b.get("text", "") for b in c
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-            break  # 只要第一条 user
-
-    seed = "\x00".join(parts) or "ogo-default"
-    return "ses_" + hashlib.sha256(seed.encode("utf-8", "replace")).hexdigest()[:32]
-
-
-def pick_session(headers, body: bytes) -> str:
-    """决定这一跳用哪个 session id。命中客户端会话头就原样用, 否则按内容派生。"""
     for h in NATIVE_SESSION_HEADERS:
         v = (headers.get(h) or "").strip()
         if v:
             return v
-    # content_derived_session 内部已加 ses_ 前缀(官方格式), 不要再包一层
-    return content_derived_session(body)
+    return None
 
 
 # ---------------------------------------------------------------- handler
@@ -270,8 +218,9 @@ class Handler(BaseHTTPRequestHandler):
             target = "/" + target
 
         # ---- 组装发往上游的 header
-        # 只在需要它的请求上补 x-opencode-session: 实测上游只对推理请求(POST)校验,
-        # GET /v1/models 这类不带也 200。非 POST 一律原样透传(客户端自带啥就是啥)。
+        # 会话头只在推理请求(POST)上处理: 上游只对 POST 校验, GET /v1/models
+        # 这类不带也 200。处理方式是「翻译」而不是「编造」——
+        # 客户端必须自带 NATIVE_SESSION_HEADERS 里的任一头, 否则 400。
         inject_session = self.command == "POST"
         out = {}
         for k, v in self.headers.items():
@@ -279,14 +228,20 @@ class Handler(BaseHTTPRequestHandler):
             # authorization 后面统一设置, 避免重复
             if lk in DROP_REQ or lk == "authorization":
                 continue
-            # POST 时客户端的 session 也跳过 —— 我们要按对话内容重新派生
-            if inject_session and lk == SESSION_HEADER:
-                continue
             out[k] = v
 
-        sid = pick_session(self.headers, body) if inject_session else ""
         if inject_session:
-            out[SESSION_HEADER] = sid
+            sid = pick_session(self.headers)
+            if not sid:
+                if self.verbose:
+                    log(f"→ {self.command} {self.path}  400 missing session")
+                return self._err(
+                    400,
+                    "missing session header: send x-session-affinity / "
+                    "x-opencode-session (the gateway does not derive one)")
+            # 客户端已有 x-opencode-session 就原样用; 只带别的会话头则翻译一份
+            if not any(k.lower() == SESSION_HEADER for k in out):
+                out[SESSION_HEADER] = sid
         # 仅当显式开了 --tag 才发; 客户端自带的则原样透传
         if self.client_tag and not any(k.lower() == CLIENT_HEADER for k in out):
             out[CLIENT_HEADER] = self.client_tag
@@ -419,7 +374,7 @@ def main():
   ────────────────────────────────────────────
   本地入口   http://{args.host}:{args.port}/v1
   上游       {Handler.upstream}
-  注入头     {SESSION_HEADER} (缺失时按对话内容派生)
+  会话头     只透传/翻译客户端自带的(x-session-affinity 等); 缺失返回 400
   ────────────────────────────────────────────
   客户端里把 Base URL 换成  http://{args.host}:{args.port}/v1
   API Key 不用改。Ctrl+C 停止。

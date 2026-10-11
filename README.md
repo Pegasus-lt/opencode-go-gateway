@@ -2,33 +2,37 @@
 
 > **中文**：[README.zh-CN.md](README.zh-CN.md)
 
-A tiny local gateway: injects the request header OpenCode Go requires, so **any
-client that can target OpenCode Go** can talk to it — no protocol changes, no
-client swap.
+A tiny local gateway: translates the session header your client already sends
+into the `x-opencode-session` header OpenCode Go requires, so **any client that
+can target OpenCode Go** can talk to it — no protocol changes, no client swap.
 
 ## The problem
 
 1. Every inference request to OpenCode Go must carry the `x-opencode-session` header. **No header → 400** (`MissingSessionID`). No negotiation.
-2. The official opencode CLI always sends it, but third-party clients (MiMoCode
-   and most others) generally have **no "custom request header" setting** —
-   there is simply nowhere to put it.
+2. Clients send all sorts of session headers (`x-session-affinity` from MiMoCode,
+   `x-claude-code-session-id` from Claude Code, …) — but **none of them is the
+   `x-opencode-session` the upstream wants**, and those clients' settings screens
+   generally have no custom-header field to fix it.
 3. The popular workaround is to **hardcode a constant** in config: it passes the
-   400, but every conversation shares one cache slot and flushes it. Cached
-   reads cost 31× less than input (`deepseek-v4-flash`: $0.22 vs $0.007 per
-   million tokens), so a dead cache means paying full price at 31× — **buying
-   pain with money**.
+    400, but every conversation shares one cache slot and flushes it. Cached
+    reads cost 31× less than input (`deepseek-v4-flash`: $0.22 vs $0.007 per
+    million tokens), so a dead cache means paying full price at 31× — **buying
+    pain with money**.
 
 ## The approach
 
 Run a small local gateway (one file, pure standard library, zero dependencies)
 and point your client's Base URL at it. **Change nothing else.**
 
-The gateway injects the header on forward:
+The gateway only **translates** the session header — it never invents one:
 
-- Client already sends a session header → **forwarded as-is**
-- Client sends none → derive a stable id from `system prompt + first user
-  message` → **the same conversation always gets the same id**
-- Injected only where it's needed (inference `POST`); `GET /models` and friends
+- Client already sends `x-opencode-session` → **forwarded as-is**
+- Client only sends `x-session-affinity` / `x-claude-code-session-id` etc. →
+  **translated into** `x-opencode-session`
+- **No session header at all → the gateway returns 400** with a message naming
+  the headers it accepts (random ids or content hashes would pass the 400 but
+  lose cache affinity and burn money at full price — so the gateway doesn't)
+- Handled only where it matters (inference `POST`); `GET /models` and friends
   aren't touched — the upstream doesn't validate them
 
 > We measured whether the upstream only recognizes the official `ses_<32hex>`
@@ -97,8 +101,13 @@ curl http://127.0.0.1:8787/v1/models
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer sk-your-key" \
   -H "Content-Type: application/json" \
+  -H "x-session-affinity: ses_00000000000000000000000000000001" \
   -d '{"model":"deepseek-v4-flash","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
 ```
+
+> curl sends no session header of its own, so add one manually
+> (`x-session-affinity` or `x-opencode-session`, any non-empty string works).
+> **Without it you get the gateway's 400 `missing session header`.**
 
 A `200` + completion means it works. The `-v` log looks like this when healthy:
 
@@ -135,6 +144,10 @@ mimo -m opencode-go/deepseek-v4-flash
 
 Or type `/models` inside the TUI.
 
+> ⚠️ MiMoCode's **ephemeral sessions send no session header**, so they are
+> rejected by the gateway with a 400 (`missing session header`). Regular
+> conversations send `x-session-affinity` and are unaffected.
+
 ### Daily startup
 
 The gateway is not set up for auto-start — start it manually before each
@@ -145,6 +158,7 @@ Keep the window minimized; closing it cuts client connections.
 
 | Symptom | Cause |
 |---|---|
+| `missing session header` | The client sent no session header. Everyday clients (MiMoCode etc.) send one and never hit this; curl / custom scripts must add `-H "x-session-affinity: ses_xxx"` |
 | Still `MissingSessionID` | Gateway not running, or Base URL set to `https://opencode.ai/zen/go/v1` (it must be `http://127.0.0.1:8787/v1`) |
 | 400 protocol error | Upstream serves three endpoint families (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) and the model doesn't match your client's protocol. Try another model. |
 | Connection refused | Gateway not running. Run `curl http://127.0.0.1:8787/_health` first; JSON back means it is up |
