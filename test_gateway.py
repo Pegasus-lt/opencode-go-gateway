@@ -14,6 +14,7 @@ test_gateway.py — ogo-gw 回归测试
   4. 非官方形态的 native session 头被整形成 ses_<32hex>
   5. x-client-request-id 不再被当成 session
   6. PUT/PATCH/DELETE/OPTIONS 不再 501
+  7. session 只在推理 POST 上注入: GET /models 不补, 客户端自带的原样透传
 """
 
 import http.client
@@ -460,10 +461,16 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(records()[0]["path"], "/v1/models?limit=5")
         self.assertIn("deepseek-v4-flash", body.decode())
 
-    def test_models_get_also_injects_session(self):
+    def test_models_get_does_not_inject_session(self):
+        """GET /v1/models 上游不校验 session, 网关不该补 —— 补了只会让日志出现无意义常量。"""
         self.call("/v1/models")
-        sid = records()[0]["headers"]["x-opencode-session"]
-        self.assertRegex(sid, r"^ses_[0-9a-f]{32}$")
+        self.assertNotIn("x-opencode-session", records()[0]["headers"])
+
+    def test_get_passes_client_session_through(self):
+        """非 POST 不注入, 但客户端自己带的 session 必须原样透传(不拦截不改写)。"""
+        sid = "ses_" + "33" * 16
+        self.call("/v1/models", headers={"x-opencode-session": sid})
+        self.assertEqual(records()[0]["headers"].get("x-opencode-session"), sid)
 
     def test_authorization_forwarded(self):
         self.call("/v1/chat/completions", data=chat_body(),
@@ -567,14 +574,15 @@ class GatewayTest(unittest.TestCase):
     # ------------------------------------------------- 方法覆盖
 
     def test_delete_put_patch_not_501(self):
+        """非 GET/POST 方法也要能转发(旧版一律 501), 且不强补 session(只给推理 POST 用)。"""
         for m in ("DELETE", "PUT", "PATCH"):
             with self.subTest(method=m):
                 st, _, body = self.call("/v1/resource/1", data=b"", method=m)
                 self.assertEqual(st, 200, f"{m} -> {st}")
                 data = json.loads(body)
                 self.assertTrue(data.get("ok"))
-                self.assertRegex(data["session"], r"^ses_[0-9a-f]{32}$",
-                                 f"{m} 没注入 session")
+                self.assertNotIn("x-opencode-session", records()[0]["headers"],
+                                 f"{m} 不该补 session")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
