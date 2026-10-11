@@ -32,10 +32,9 @@ The gateway injects the header on forward:
   aren't touched — the upstream doesn't validate them
 
 > We measured whether the upstream only recognizes the official `ses_<32hex>`
-> shape as a cache key — it doesn't: 7/7 shapes hit the cache
-> (`_probe_session_form.py`, 2026-10-10, `deepseek-v4-flash`). So the value is
-> passed through untouched; rewriting a client's session identity would be
-> surprising for no benefit.
+> shape as a cache key — it doesn't: 7/7 shapes hit the cache (2026-10-10,
+> `deepseek-v4-flash`). So the value is passed through untouched; rewriting a
+> client's session identity would be surprising for no benefit.
 
 Result: the 400 is gone, and each conversation keeps its own warm cache. Not a
 fake constant-header fix — a fix that actually preserves the cache.
@@ -150,19 +149,6 @@ Keep the window minimized; closing it cuts client connections.
 | 400 protocol error | Upstream serves three endpoint families (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) and the model doesn't match your client's protocol. Try another model. |
 | Connection refused | Gateway not running. Run `curl http://127.0.0.1:8787/_health` first; JSON back means it is up |
 | Slow first token | Normal — streaming is forwarded without buffering. If it suddenly got slow, buffering was introduced somewhere |
-
-## Tests
-
-Local regression suite — **no API key needed, and it never talks to the real
-upstream** (it starts a mock upstream plus a real gateway in-process):
-
-```bash
-python test_gateway.py -v
-```
-
-It covers: no traceback on client abort (Windows), session form and
-stability, cache affinity, SSE not being buffered, chunked uploads, and
-header integrity on forward.
 
 ## License
 

@@ -54,9 +54,9 @@ DEFAULT_CLIENT_TAG = ""
 # session 会让每次请求换一次 session, 缓存永远打不中, 而且是静默失效
 # (过了 400, 但按全价烧钱)。
 #
-# 不做形态整形: 实测(_probe_session_form.py, 2026-10-10, deepseek-v4-flash)
-# 上游缓存与 session 形态无关 —— 7 种形态(官方/大写/裸 hex/短串/uuid/非hex)
-# 全部命中。网关是透明代理, 改写客户端的会话身份既没必要也不让人意外。
+# 不做形态整形: 2026-10-10 实测(deepseek-v4-flash) 上游缓存与 session 形态无关
+# —— 7 种形态(官方/大写/裸 hex/短串/uuid/非hex)全部命中。网关是透明代理,
+# 改写客户端的会话身份既没必要也不让人意外。
 NATIVE_SESSION_HEADERS = [
     "x-opencode-session",
     "x-claude-code-session-id",
@@ -102,8 +102,8 @@ def content_derived_session(body: bytes) -> str:
     ses_<32hex> -> cached_tokens 384。即裸 hex 在部分模型上不被识别为缓存键,
     等于过了 400 但缓存全废, 按全价烧钱。
 
-    刻意不含 model: 实测(_probe_session_model.py, 2026-10-10) 上游缓存是
-    model-aware 的 —— 同 prompt 同 session 换模型是冷的, model 已经在缓存键里。
+    刻意不含 model: 2026-10-10 实测 上游缓存是 model-aware 的 —— 同 prompt
+    同 session 换模型是冷的, model 已经在缓存键里。
     不同模型共用 session 不会串答案, 颠簸也可以忽略, 放进 seed 属于多余。
     派生只需保证"同对话同 id", 不需要区分模型。
 
