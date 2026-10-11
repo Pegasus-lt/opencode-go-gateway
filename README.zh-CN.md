@@ -6,7 +6,7 @@
 
 ## 问题
 
-1. OpenCode Go 要求每个请求都带 `x-opencode-session` 头，**不带就报 400**（`MissingSessionID`），没有商量余地。
+1. OpenCode Go 每个推理请求都必须带 `x-opencode-session` 头，**不带就报 400**（`MissingSessionID`），没有商量余地。
 2. 官方 opencode CLI 自动带这个头，但第三方客户端（MiMoCode 等大多数第三方客户端）普遍**没有「自定义请求头」的设置项**——这个头根本没地方填。
 3. 网上流传的土办法是在配置里**写死一个常量**：能过 400，但所有对话共用一个缓存槽、互相冲刷。缓存读比输入便宜 31 倍（`deepseek-v4-flash`：$0.22 vs $0.007 每百万 token），缓存全废等于按 31 倍全价烧钱——**花钱买罪受**。
 
@@ -18,6 +18,7 @@
 
 - 客户端自己带了会话头 → **原样透传**
 - 客户端没带 → 按「system prompt + 第一条用户消息」算出一个稳定 id → **同一段对话永远是同一个 id**
+- 只在需要的请求上补（推理 POST）；`GET /models` 这类上游不校验，网关不打扰
 
 > 我们实测过上游是不是只认官方形态 `ses_<32hex>` 当缓存键 —— 不是：
 > 7 种形态全部命中（`_probe_session_form.py`，2026-10-10，`deepseek-v4-flash`）。

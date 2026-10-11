@@ -229,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.split("?")[0] == "/_health":
             return self._health()
-        # /models 这类: 走同一条转发逻辑(也注入头)
+        # /models 这类: 走同一条转发逻辑(不补 session, 上游不需要)
         return self._forward()
 
     def do_POST(self):
@@ -270,16 +270,23 @@ class Handler(BaseHTTPRequestHandler):
             target = "/" + target
 
         # ---- 组装发往上游的 header
+        # 只在需要它的请求上补 x-opencode-session: 实测上游只对推理请求(POST)校验,
+        # GET /v1/models 这类不带也 200。非 POST 一律原样透传(客户端自带啥就是啥)。
+        inject_session = self.command == "POST"
         out = {}
         for k, v in self.headers.items():
             lk = k.lower()
-            # 跳过 x-opencode-session 和 authorization, 后面统一设置, 避免重复
-            if lk in DROP_REQ or lk in (SESSION_HEADER, "authorization"):
+            # authorization 后面统一设置, 避免重复
+            if lk in DROP_REQ or lk == "authorization":
+                continue
+            # POST 时客户端的 session 也跳过 —— 我们要按对话内容重新派生
+            if inject_session and lk == SESSION_HEADER:
                 continue
             out[k] = v
 
-        sid = pick_session(self.headers, body)
-        out[SESSION_HEADER] = sid
+        sid = pick_session(self.headers, body) if inject_session else ""
+        if inject_session:
+            out[SESSION_HEADER] = sid
         # 仅当显式开了 --tag 才发; 客户端自带的则原样透传
         if self.client_tag and not any(k.lower() == CLIENT_HEADER for k in out):
             out[CLIENT_HEADER] = self.client_tag
@@ -299,7 +306,10 @@ class Handler(BaseHTTPRequestHandler):
 
         path = (u.path.rstrip("/") + target) or "/"
         if self.verbose:
-            log(f"→ {self.command} {path}  session={sid[:14]}…")
+            if inject_session:
+                log(f"→ {self.command} {path}  session={sid[:14]}…")
+            else:
+                log(f"→ {self.command} {path}")
 
         try:
             conn = (http.client.HTTPSConnection(u.hostname, u.port or 443,

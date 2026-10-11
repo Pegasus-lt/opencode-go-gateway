@@ -8,8 +8,7 @@ client swap.
 
 ## The problem
 
-1. OpenCode Go requires every request to carry the `x-opencode-session` header.
-   **No header → 400** (`MissingSessionID`). No negotiation.
+1. Every inference request to OpenCode Go must carry the `x-opencode-session` header. **No header → 400** (`MissingSessionID`). No negotiation.
 2. The official opencode CLI always sends it, but third-party clients (MiMoCode
    and most others) generally have **no "custom request header" setting** —
    there is simply nowhere to put it.
@@ -29,6 +28,8 @@ The gateway injects the header on forward:
 - Client already sends a session header → **forwarded as-is**
 - Client sends none → derive a stable id from `system prompt + first user
   message` → **the same conversation always gets the same id**
+- Injected only where it's needed (inference `POST`); `GET /models` and friends
+  aren't touched — the upstream doesn't validate them
 
 > We measured whether the upstream only recognizes the official `ses_<32hex>`
 > shape as a cache key — it doesn't: 7/7 shapes hit the cache
