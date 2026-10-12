@@ -135,6 +135,7 @@ mimo -m opencode-go/deepseek-v4-flash
 |---|---|
 | `missing session header` | 客户端没带任何会话头。日常客户端（MiMoCode 等）自带，不会遇到；curl/自建脚本要手动加 `-H "x-session-affinity: ses_xxx"` |
 | 标题生成这类小调用也报 `missing session header` | 附属小调用（ephemeral）**不带会话头**，而 `model_groups.lite` 默认会落到你的默认模型（= 经网关）。把 lite 指到不经网关的 provider 即可：`"model_groups": {"lite": "xiaomi/mimo-v2.6-flash"}`（主对话不受影响，只是标题会退化成首句截断） |
+| 子代理（如 checkpoint-writer）会被网关拒吗？ | 不会。它们**继承父会话**的会话头，自带 `x-session-affinity` → 网关正常放行。它们走网关、消耗 Go 额度；唯一风险是请求体随会话增长——**超长会话（~1.2MB 起）会撞上游体积限制并陷入重试** |
 | 还是报 `MissingSessionID` | 网关没起，或 Base URL 填成了 `https://opencode.ai/zen/go/v1`（应该是 `http://127.0.0.1:8787/v1`） |
 | 400 协议错误 | 上游有三种端点（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`），模型和你客户端的协议对不上——换一个模型就行 |
 | 连接被拒 | 网关没在跑。先 `curl http://127.0.0.1:8787/_health`，返回 JSON 就是好的 |

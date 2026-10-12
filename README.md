@@ -160,6 +160,7 @@ Keep the window minimized; closing it cuts client connections.
 |---|---|
 | `missing session header` | The client sent no session header. Everyday clients (MiMoCode etc.) send one and never hit this; curl / custom scripts must add `-H "x-session-affinity: ses_xxx"` |
 | Title generation / other small calls also hit `missing session header` | Auxiliary (ephemeral) calls **send no session header**, and `model_groups.lite` defaults to your default model (= through the gateway). Point lite at a non-gateway provider: `"model_groups": {"lite": "xiaomi/mimo-v2.6-flash"}` (main conversations are unaffected; only titles fall back to a first-sentence cut) |
+| Do subagents (checkpoint-writer etc.) get rejected by the gateway? | No. They **inherit the parent session's** session header (`x-session-affinity`) and pass the gateway normally. They do go through the gateway and consume Go quota; the only risk is request size — **very long sessions (~1.2MB+) hit the upstream's body-size limit and stuck in a retry loop** |
 | Still `MissingSessionID` | Gateway not running, or Base URL set to `https://opencode.ai/zen/go/v1` (it must be `http://127.0.0.1:8787/v1`) |
 | 400 protocol error | Upstream serves three endpoint families (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) and the model doesn't match your client's protocol. Try another model. |
 | Connection refused | Gateway not running. Run `curl http://127.0.0.1:8787/_health` first; JSON back means it is up |
