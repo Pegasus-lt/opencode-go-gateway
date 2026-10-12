@@ -5,6 +5,7 @@ _gateway_run.prev.log
 _gateway.log
 _selftest_gw.log
 _selftest_gw.err
+_gw_diag.log
 
 # 会话/工具目录
 .mimocode/

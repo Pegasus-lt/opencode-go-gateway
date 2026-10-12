@@ -85,6 +85,21 @@ DROP_REQ = HOP_BY_HOP | {"host", "content-length", "accept-encoding"}
 BLOCKED_UA_PREFIX = "python-urllib/"
 GATEWAY_UA = "ogo-gw/1.0"
 
+# 上游连接策略 —— 必须自己挑地址, 不能交给 socket.create_connection:
+# 它按 DNS 顺序逐个试, 但**每个地址共用同一个 timeout**。而上游的 timeout
+# 是 STREAM_TIMEOUT(600s, SSE 长连接需要), 于是第一个地址若被黑洞
+# (敲了没反应, 不是快速报错) 就白等 600 秒, 永远走不到后面能通的地址。
+# 实测(2026-10-12): 本机解析 opencode.ai 时四条 AAAA 排在四条 A 之前,
+# 而 v6 到 Cloudflare 的多数地址是黑洞 —— 经网关 0/5 失败(每次 8s 超时),
+# 同一秒直连 5/5 成功(1s 内)。客户端约 57s 放弃 -> 卡住的连接被中止 ->
+# 502 upstream request failed: [WinError 10053]。
+# 所以: 每个地址最多 CONNECT_TIMEOUT 秒、IPv4 优先、总预算 CONNECT_BUDGET 秒,
+# 连上后立刻恢复 STREAM_TIMEOUT(流式输出不受影响)。
+CONNECT_TIMEOUT = 3     # 单个上游地址的 TCP 连接上限(秒)
+TLS_TIMEOUT = 15        # TLS 握手上限(秒), 握手完成即恢复 STREAM_TIMEOUT
+CONNECT_BUDGET = 15     # 连接阶段总预算(秒), 用尽即放弃
+STREAM_TIMEOUT = 600    # 连上之后的读写超时(SSE 需要长超时, 与原行为一致)
+
 
 # ---------------------------------------------------------------- helpers
 
@@ -102,6 +117,77 @@ def pick_session(headers) -> str:
         if v:
             return v
     return None
+
+
+_good_addr = {}          # host -> 上次连通的 sockaddr(下次优先试它)
+_good_lock = threading.Lock()
+
+
+def _dial(host: str, port: int):
+    """逐个地址尝试连接上游(上次连通的优先), 返回已连上的 socket。
+
+    每个地址单独计时 CONNECT_TIMEOUT, 整体不超过 CONNECT_BUDGET ——
+    避免把长读超时(STREAM_TIMEOUT)当成"这个地址敲不开要等多久"。
+    黑洞地址(不回应)会在 CONNECT_TIMEOUT 后被放弃并换下一个。
+
+    单独记忆"上次连通的地址": 上游一批地址里常有多个黑洞, 顺序试一遍要
+    好几秒(实测 3 个黑洞 + 1 个可用 = 9.3s), 而网关每个请求都新建连接,
+    不能每次都白付这份时间。记错了也只是多付一个 CONNECT_TIMEOUT, 会自愈。
+    """
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    # 排序: 上次连通的地址最优先; 否则 IPv4 优先 —— 实测本机到 Cloudflare
+    # 的 IPv6 路径多数是黑洞, A 记录里至少有一个长期可用。两个家族都会试。
+    with _good_lock:
+        hint = _good_addr.get(host)
+    if hint:
+        infos.sort(key=lambda i: 0 if i[4] == hint else 1)
+    else:
+        infos.sort(key=lambda i: 0 if i[0] == socket.AF_INET else 1)
+    deadline = time.monotonic() + CONNECT_BUDGET
+    last = None
+    tried = 0
+    for af, socktype, proto, _, sa in infos:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        s = socket.socket(af, socktype, proto)
+        s.settimeout(min(CONNECT_TIMEOUT, left))
+        try:
+            s.connect(sa)
+        except OSError as e:
+            last = e
+            tried += 1
+            s.close()
+            continue
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        with _good_lock:
+            _good_addr[host] = sa
+        return s
+    raise TimeoutError(
+        f"no upstream address reachable within {CONNECT_BUDGET}s "
+        f"({tried} tried, last: {last})")
+
+
+class _UpstreamHTTPS(http.client.HTTPSConnection):
+    """HTTPS 上游: 用 _dial 挑地址, 连上后把超时恢复成 STREAM_TIMEOUT。"""
+
+    def connect(self):
+        if self._tunnel_host:            # 本网关不开隧道, 兜住父类语义
+            return super().connect()
+        self.sock = _dial(self.host, self.port)
+        self.sock.settimeout(TLS_TIMEOUT)     # 握手单独给上限, 不占读超时
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+        self.sock.settimeout(self.timeout)    # 之后按 STREAM_TIMEOUT 读写
+
+
+class _UpstreamHTTP(http.client.HTTPConnection):
+    """明文上游(默认不用, --upstream 给 http:// 时才走)。"""
+
+    def connect(self):
+        if self._tunnel_host:
+            return super().connect()
+        self.sock = _dial(self.host, self.port)
+        self.sock.settimeout(self.timeout)
 
 
 # ---------------------------------------------------------------- handler
@@ -266,11 +352,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 log(f"→ {self.command} {path}")
 
+        # 连接显式做掉: 一是让"连不上"和"发不出去"在 502 文案里分得开,
+        # 二是 _dial 逐地址短超时挑一个能通的(见 _dial 注释)。
         try:
-            conn = (http.client.HTTPSConnection(u.hostname, u.port or 443,
-                                                timeout=600, context=ssl.create_default_context())
+            conn = (_UpstreamHTTPS(u.hostname, u.port or 443, timeout=STREAM_TIMEOUT,
+                                   context=ssl.create_default_context())
                     if u.scheme == "https"
-                    else http.client.HTTPConnection(u.hostname, u.port or 80, timeout=600))
+                    else _UpstreamHTTP(u.hostname, u.port or 80, timeout=STREAM_TIMEOUT))
+            conn.connect()
+            if self.verbose:
+                log(f"   upstream via {conn.sock.getpeername()[0]}")
         except Exception as e:
             return self._err(502, f"upstream connect failed: {e}")
 
