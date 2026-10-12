@@ -44,6 +44,11 @@ The gateway only **translates** the session header — it never invents one:
 Result: the 400 is gone, and each conversation keeps its own warm cache. Not a
 fake constant-header fix — a fix that actually preserves the cache.
 
+> If your client can rewrite its own outgoing headers, you don't need the
+> gateway: MiMoCode exposes a plugin hook (`chat.headers`) where setting
+> `x-opencode-session` fixes the 400 in-process. The gateway is for clients that
+> offer no such hook.
+
 ## How to use
 
 ### 1. Start the gateway
