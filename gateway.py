@@ -65,6 +65,12 @@ NATIVE_SESSION_HEADERS = [
     "x-claude-code-session-id",
     "x-deepseek-harness-session-id",
     "x-session-affinity",
+    # 某些 CLI 的模型请求会无条件带上 X-Conversation-ID, 值就是会话 id,
+    # 同一会话的所有请求取同一个值 —— 正是缓存亲和要的粒度。
+    # 别用同一批里的 X-Conversation-Request-ID / X-Request-ID /
+    # X-Conversation-Message-ID: 那三个每条消息都变, 拿来当 session 能过 400
+    # 但缓存永远打不中, 属于静默按全价烧钱。
+    "x-conversation-id",
     "x-session-id",
     "session-id",
     "session_id",
@@ -99,6 +105,7 @@ CONNECT_TIMEOUT = 3     # 单个上游地址的 TCP 连接上限(秒)
 TLS_TIMEOUT = 15        # TLS 握手上限(秒), 握手完成即恢复 STREAM_TIMEOUT
 CONNECT_BUDGET = 15     # 连接阶段总预算(秒), 用尽即放弃
 STREAM_TIMEOUT = 600    # 连上之后的读写超时(SSE 需要长超时, 与原行为一致)
+RETRY = 1               # 连接/发送阶段失败时额外重试次数(干扰是突发性的)
 
 
 # ---------------------------------------------------------------- helpers
@@ -169,14 +176,23 @@ def _dial(host: str, port: int):
 
 
 class _UpstreamHTTPS(http.client.HTTPSConnection):
-    """HTTPS 上游: 用 _dial 挑地址, 连上后把超时恢复成 STREAM_TIMEOUT。"""
+    """HTTPS 上游: 用 _dial 挑地址, 连上后把超时恢复成 STREAM_TIMEOUT。
+
+    经代理时(self._tunnel_host 有值)先发 CONNECT 建隧道再握手,
+    Host/SNI 仍是目标站(opencode.ai), 由父类按 _tunnel_host 自动取。
+
+    隧道分支也必须自己 _dial: 否则会退回父类的 create_connection,
+    把 STREAM_TIMEOUT 当成连接超时, 本次修的"吊死在黑洞地址"会复发。
+    """
 
     def connect(self):
-        if self._tunnel_host:            # 本网关不开隧道, 兜住父类语义
-            return super().connect()
         self.sock = _dial(self.host, self.port)
+        if self._tunnel_host:
+            self.sock.settimeout(TLS_TIMEOUT)
+            self._tunnel()
         self.sock.settimeout(TLS_TIMEOUT)     # 握手单独给上限, 不占读超时
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=self._tunnel_host or self.host)
         self.sock.settimeout(self.timeout)    # 之后按 STREAM_TIMEOUT 读写
 
 
@@ -184,9 +200,10 @@ class _UpstreamHTTP(http.client.HTTPConnection):
     """明文上游(默认不用, --upstream 给 http:// 时才走)。"""
 
     def connect(self):
-        if self._tunnel_host:
-            return super().connect()
         self.sock = _dial(self.host, self.port)
+        if self._tunnel_host:
+            self.sock.settimeout(TLS_TIMEOUT)
+            self._tunnel()
         self.sock.settimeout(self.timeout)
 
 
@@ -197,6 +214,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "ogo-gw"
     upstream = DEFAULT_UPSTREAM
     client_tag = DEFAULT_CLIENT_TAG
+    proxy = None          # urlsplit 结果; None = 直连上游
     verbose = False
 
     # ---- util
@@ -296,8 +314,72 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- core
 
+    def _new_conn(self, u):
+        """建上游连接对象。设了 --proxy 就连代理并发 CONNECT 隧道。
+
+        隧道下 Host/SNI 仍是目标站(由 _UpstreamHTTPS.connect 按 _tunnel_host 取),
+        所以上游看到的是 opencode.ai, 代理只当传输通道。
+        """
+        p = self.proxy
+        if u.scheme == "https":
+            conn = _UpstreamHTTPS(p.hostname if p else u.hostname,
+                                  (p.port or 80) if p else (u.port or 443),
+                                  timeout=STREAM_TIMEOUT,
+                                  context=ssl.create_default_context())
+            if p:
+                conn.set_tunnel(u.hostname, u.port or 443)
+            return conn
+        conn = _UpstreamHTTP(p.hostname if p else u.hostname,
+                             (p.port or 80) if p else (u.port or 80),
+                             timeout=STREAM_TIMEOUT)
+        if p:
+            conn.set_tunnel(u.hostname, u.port or 80)
+        return conn
+
+    def _open_upstream(self, u, path, body, out):
+        """连接 + 发送请求; 连接/发送阶段失败时换地址重试。
+
+        返回 (conn, None) 或 (None, "upstream <阶段> failed: <err>")。
+        这里**不含** getresponse() —— 那一步失败一律不重试: 请求可能已经在
+        模型侧跑过, 重发等于重复计费(本项目最忌讳的就是静默烧钱)。
+        """
+        err = None
+        for attempt in range(RETRY + 1):
+            conn = self._new_conn(u)
+            if attempt:
+                # 上一轮那个地址已不可信: 清掉缓存提示, 让 _dial 重新按 IPv4 优先扫
+                with _good_lock:
+                    _good_addr.pop(u.hostname, None)
+            phase = "connect"
+            try:
+                conn.connect()
+                if self.verbose:
+                    log(f"   upstream via {conn.sock.getpeername()[0]}")
+                phase = "request"
+                conn.request(self.command, path, body=body or None, headers=out)
+                return conn, None
+            except Exception as e:
+                err = f"upstream {phase} failed: {e}"
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if attempt < RETRY and self.verbose:
+                    log(f"   retry {attempt + 1}/{RETRY} ({phase}): {e}")
+        return None, err
+
     def _forward(self):
         body = self._read_body()
+        if self.verbose:
+            # 把客户端原始请求头打出来(Authorization 全遮)。
+            # 排查"客户端到底带了哪个会话头"时, 这是唯一可信的一手材料 ——
+            # 光看 400 missing session 只能知道"没带我们认识的头", 推不出
+            # "它其实带了别的名字的会话头"。
+            for k, v in self.headers.items():
+                # Authorization 全遮: 截断到前 12 字符仍会泄漏 key 前缀,
+                # 而日志一旦落盘就洗不掉(gitignore 只挡入库, 不挡留痕)。
+                shown = "<redacted>" if k.lower() == "authorization" and v else v
+                log(f"    < {k}: {shown}")
         u = urllib.parse.urlsplit(self.upstream)
         target = self.path
         if not target.startswith("/"):
@@ -352,28 +434,20 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 log(f"→ {self.command} {path}")
 
-        # 连接显式做掉: 一是让"连不上"和"发不出去"在 502 文案里分得开,
-        # 二是 _dial 逐地址短超时挑一个能通的(见 _dial 注释)。
-        try:
-            conn = (_UpstreamHTTPS(u.hostname, u.port or 443, timeout=STREAM_TIMEOUT,
-                                   context=ssl.create_default_context())
-                    if u.scheme == "https"
-                    else _UpstreamHTTP(u.hostname, u.port or 80, timeout=STREAM_TIMEOUT))
-            conn.connect()
-            if self.verbose:
-                log(f"   upstream via {conn.sock.getpeername()[0]}")
-        except Exception as e:
-            return self._err(502, f"upstream connect failed: {e}")
+        # 连接+发送交给 _open_upstream(逐地址短超时 + 突发失败换地址重试);
+        # 这里只剩读响应头, 失败不重试。
+        conn, err = self._open_upstream(u, path, body, out)
+        if err:
+            return self._err(502, err)
 
         try:
-            conn.request(self.command, path, body=body or None, headers=out)
             resp = conn.getresponse()
         except Exception as e:
             try:
                 conn.close()
             except Exception:
                 pass
-            return self._err(502, f"upstream request failed: {e}")
+            return self._err(502, f"upstream response failed: {e}")
 
         ctype = resp.getheader("Content-Type", "")
         streaming = "event-stream" in ctype.lower()
@@ -450,6 +524,10 @@ def main():
     ap.add_argument("--tag", default=DEFAULT_CLIENT_TAG,
                     help="x-opencode-client 的值(默认空=不发送该头; 非必需)")
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--proxy", default="",
+                    help="HTTP 代理(如 http://127.0.0.1:10841); 空=直连上游。"
+                         "Python 的 http.client 不认 HTTPS_PROXY/系统代理, "
+                         "想让网关走梯子只能显式给这个参数")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印每跳日志")
     args = ap.parse_args()
 
@@ -457,14 +535,22 @@ def main():
     Handler.client_tag = args.tag
     Handler.verbose = args.verbose
 
+    if args.proxy:
+        raw = args.proxy if "//" in args.proxy else "http://" + args.proxy
+        p = urllib.parse.urlsplit(raw)
+        if p.scheme != "http" or not p.hostname:
+            sys.exit(f"--proxy 只支持 http://host:port (CONNECT 隧道), 收到: {args.proxy}")
+        Handler.proxy = p
+
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
 
+    via = f"{Handler.proxy.hostname}:{Handler.proxy.port or 80} (CONNECT)" if Handler.proxy else "直连"
     print(f"""
   ogo-gw  已启动
   ────────────────────────────────────────────
   本地入口   http://{args.host}:{args.port}/v1
-  上游       {Handler.upstream}
+  上游       {Handler.upstream}  [{via}]
   会话头     只透传/翻译客户端自带的(x-session-affinity 等); 缺失返回 400
   ────────────────────────────────────────────
   客户端里把 Base URL 换成  http://{args.host}:{args.port}/v1

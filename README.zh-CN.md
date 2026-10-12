@@ -7,7 +7,7 @@
 ## 问题
 
 1. OpenCode Go 每个推理请求都必须带 `x-opencode-session` 头，**不带就报 400**（`MissingSessionID`），没有商量余地。
-2. 客户端们各自发的会话头五花八门（MiMoCode 发 `x-session-affinity`、Claude Code 发 `x-claude-code-session-id`……），但**没有一个是上游认的 `x-opencode-session`**，而且这些客户端的设置界面普遍没有「自定义请求头」入口，改不了。
+2. 客户端们各自发的会话头五花八门（MiMoCode 发 `x-session-affinity`、Claude Code 发 `x-claude-code-session-id`、某些 CLI 发 `x-conversation-id`……），但**没有一个是上游认的 `x-opencode-session`**，而且这些客户端的设置界面普遍没有「自定义请求头」入口，改不了。
 3. 网上流传的土办法是在配置里**写死一个常量**：能过 400，但所有对话共用一个缓存槽、互相冲刷。缓存读比输入便宜 31 倍（`deepseek-v4-flash`：$0.22 vs $0.007 每百万 token），缓存全废等于按 31 倍全价烧钱——**花钱买罪受**。
 
 ## 解决思路

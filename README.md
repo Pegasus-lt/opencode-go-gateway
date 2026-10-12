@@ -10,7 +10,8 @@ can target OpenCode Go** can talk to it — no protocol changes, no client swap.
 
 1. Every inference request to OpenCode Go must carry the `x-opencode-session` header. **No header → 400** (`MissingSessionID`). No negotiation.
 2. Clients send all sorts of session headers (`x-session-affinity` from MiMoCode,
-   `x-claude-code-session-id` from Claude Code, …) — but **none of them is the
+   `x-claude-code-session-id` from Claude Code, `x-conversation-id` from
+   some CLI agents, …) — but **none of them is the
    `x-opencode-session` the upstream wants**, and those clients' settings screens
    generally have no custom-header field to fix it.
 3. The popular workaround is to **hardcode a constant** in config: it passes the
